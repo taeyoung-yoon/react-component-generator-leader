@@ -1,9 +1,25 @@
 import { useState, useEffect } from 'react';
+import { usePersistentState } from './hooks/usePersistentState';
 import { PromptInput } from './components/PromptInput';
 import { ComponentCard } from './components/ComponentCard';
 import { useComponentGenerator } from './hooks/useComponentGenerator';
 import type { Provider } from './types';
 import './App.css';
+
+const PROVIDER_KEY = 'rcg:provider';
+const API_KEYS_KEY = 'rcg:apiKeys';
+
+const isProvider = (raw: unknown): Provider | null =>
+  raw === 'anthropic' || raw === 'google' ? raw : null;
+
+const parseApiKeys = (raw: unknown): Partial<Record<Provider, string>> | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const { anthropic, google } = raw as Record<string, unknown>;
+  return {
+    ...(typeof anthropic === 'string' && { anthropic }),
+    ...(typeof google === 'string' && { google }),
+  };
+};
 
 const PROVIDER_CONFIG = {
   anthropic: { label: 'Anthropic', placeholder: 'sk-ant-...' },
@@ -11,14 +27,20 @@ const PROVIDER_CONFIG = {
 } as const;
 
 function App() {
-  const [apiKey, setApiKey] = useState('');
+  const [apiKeys, setApiKeys] = usePersistentState<Partial<Record<Provider, string>>>(
+    API_KEYS_KEY,
+    {},
+    parseApiKeys,
+  );
   const [showKey, setShowKey] = useState(false);
-  const [provider, setProvider] = useState<Provider>('google');
+  const [provider, setProvider] = usePersistentState<Provider>(PROVIDER_KEY, 'google', isProvider);
+  const apiKey = apiKeys[provider] ?? '';
+  const setApiKey = (value: string) => setApiKeys((prev) => ({ ...prev, [provider]: value }));
   const [envKeys, setEnvKeys] = useState<Record<Provider, boolean>>({
     anthropic: false,
     google: false,
   });
-  const { components, isLoading, error, generate, removeComponent, clearAll } =
+  const { components, promptHistory, isLoading, error, generate, removeComponent, clearAll } =
     useComponentGenerator();
 
   useEffect(() => {
@@ -40,7 +62,6 @@ function App() {
 
   const handleProviderChange = (newProvider: Provider) => {
     setProvider(newProvider);
-    setApiKey('');
   };
 
   const activeProvider = PROVIDER_CONFIG[provider].label;
@@ -68,7 +89,7 @@ function App() {
 
       <main className="workspace">
         <section className="composer-panel" aria-label="컴포넌트 생성">
-          <PromptInput onGenerate={handleGenerate} isLoading={isLoading} />
+          <PromptInput onGenerate={handleGenerate} isLoading={isLoading} history={promptHistory} />
         </section>
 
         <aside className="settings-panel" aria-label="실행 설정">
