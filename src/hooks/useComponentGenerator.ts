@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import type { GeneratedComponent, Provider } from '../types';
 import { addToHistory, parseHistory } from '../lib/history';
 import { parseComponents } from '../lib/storedComponents';
+import { readStreamEvents } from '../lib/streamEvents';
 import { usePersistentState } from './usePersistentState';
 
 const COMPONENTS_KEY = 'rcg:components';
@@ -9,6 +10,8 @@ const HISTORY_KEY = 'rcg:promptHistory';
 
 interface UseComponentGeneratorReturn {
   components: GeneratedComponent[];
+  /** 스트리밍으로 생성 중인 컴포넌트. 완료되면 같은 id로 components에 확정된다. */
+  pending: GeneratedComponent | null;
   promptHistory: string[];
   isLoading: boolean;
   error: string | null;
@@ -28,6 +31,7 @@ export function useComponentGenerator(): UseComponentGeneratorReturn {
     [],
     parseHistory,
   );
+  const [pending, setPending] = useState<GeneratedComponent | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -35,32 +39,45 @@ export function useComponentGenerator(): UseComponentGeneratorReturn {
     setIsLoading(true);
     setError(null);
 
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const createdAt = new Date();
+
     try {
-      const res = await fetch('/api/generate', {
+      const res = await fetch('/api/generate/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, ...(apiKey && { apiKey }), provider }),
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
+        const data = await res.json();
         throw new Error(data.error || 'Failed to generate component');
       }
 
-      const newComponent: GeneratedComponent = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        prompt,
-        code: data.code,
-        createdAt: new Date(),
-      };
+      setPending({ id, prompt, code: '', createdAt });
 
-      setComponents((prev) => [newComponent, ...prev]);
+      let finalCode: string | null = null;
+      for await (const event of readStreamEvents(res.body)) {
+        if (event.type === 'delta') {
+          setPending((prev) => (prev ? { ...prev, code: prev.code + event.text } : prev));
+        } else if (event.type === 'error') {
+          throw new Error(event.error);
+        } else {
+          finalCode = event.code;
+        }
+      }
+
+      if (finalCode === null) {
+        throw new Error('응답이 중간에 끊겼습니다. 다시 시도해주세요.');
+      }
+
+      setComponents((prev) => [{ id, prompt, code: finalCode, createdAt }, ...prev]);
       setPromptHistory((prev) => addToHistory(prev, prompt));
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(message);
     } finally {
+      setPending(null);
       setIsLoading(false);
     }
   }, [setComponents, setPromptHistory]);
@@ -73,5 +90,5 @@ export function useComponentGenerator(): UseComponentGeneratorReturn {
     setComponents([]);
   }, [setComponents]);
 
-  return { components, promptHistory, isLoading, error, generate, removeComponent, clearAll };
+  return { components, pending, promptHistory, isLoading, error, generate, removeComponent, clearAll };
 }

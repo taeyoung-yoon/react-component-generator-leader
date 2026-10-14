@@ -40,7 +40,7 @@ function App() {
     anthropic: false,
     google: false,
   });
-  const { components, promptHistory, isLoading, error, generate, removeComponent, clearAll } =
+  const { components, pending, promptHistory, isLoading, error, generate, removeComponent, clearAll } =
     useComponentGenerator();
 
   useEffect(() => {
@@ -149,7 +149,7 @@ function App() {
       )}
 
       <section className="results-section">
-        {components.length > 0 && (
+        {(components.length > 0 || pending) && (
           <div className="results-header">
             <div>
               <span className="panel-kicker">Generated</span>
@@ -161,7 +161,7 @@ function App() {
           </div>
         )}
 
-        {components.length === 0 && !isLoading && (
+        {components.length === 0 && !isLoading && !pending && (
           <div className="empty-state">
             <div className="empty-preview" aria-hidden="true">
               <div className="empty-window">
@@ -181,7 +181,7 @@ function App() {
           </div>
         )}
 
-        {isLoading && (
+        {isLoading && !pending && (
           <div className="loading-card">
             <div className="loading-pulse" />
             <p>컴포넌트를 생성하고 있습니다...</p>
@@ -189,10 +189,11 @@ function App() {
         )}
 
         <div className="results-grid">
-          {components.map((component) => (
+          {(pending ? [pending, ...components] : components).map((component) => (
             <ComponentCard
               key={component.id}
               component={component}
+              isStreaming={component.id === pending?.id}
               onRemove={removeComponent}
               onRegenerate={handleGenerate}
               isLoading={isLoading}

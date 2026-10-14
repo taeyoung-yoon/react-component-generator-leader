@@ -648,6 +648,35 @@
   line-height: 1.65;
 }
 
+/* 스트리밍 중에는 높이를 제한해 새 코드를 따라 스크롤하고, 커서를 깜빡인다. */
+.code-block--streaming {
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.code-block--streaming code::after {
+  content: '▍';
+  margin-left: 1px;
+  color: #38bdf8;
+  animation: code-cursor 1s steps(1) infinite;
+}
+
+@keyframes code-cursor {
+  50% {
+    opacity: 0;
+  }
+}
+
+.tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-copy:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 @media (max-width: 1080px) {
   .app {
     padding: 18px;

@@ -1,5 +1,6 @@
 import { stripCodeFences, ensureRenderCall } from './generator';
 import { withModelFallback } from './fallback';
+import { readSseData, extractAnthropicDelta, extractGoogleDelta } from './stream';
 
 // 우선순위 순서. 앞 모델이 실패하면 다음 모델로 폴백한다.
 const GOOGLE_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
@@ -135,6 +136,112 @@ async function callGoogle(prompt: string, apiKey: string): Promise<string> {
   return withModelFallback(GOOGLE_MODELS, (model) => callGoogleModel(prompt, apiKey, model));
 }
 
+// 스트리밍 호출: 응답 헤더를 받은 시점까지의 실패는 일반 호출과 같은 에러 형식으로 던진다.
+async function openAnthropicStream(prompt: string, apiKey: string): Promise<ReadableStream<Uint8Array>> {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 4096,
+      stream: true,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Claude API error: ${response.status}`);
+  }
+  return response.body;
+}
+
+async function openGoogleStreamModel(
+  prompt: string,
+  apiKey: string,
+  model: string,
+): Promise<ReadableStream<Uint8Array>> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8192 },
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Gemini API error: ${response.status}`);
+  }
+  return response.body;
+}
+
+function openGoogleStream(prompt: string, apiKey: string): Promise<ReadableStream<Uint8Array>> {
+  return withModelFallback(GOOGLE_MODELS, (model) => openGoogleStreamModel(prompt, apiKey, model));
+}
+
+// 프로바이더 에러를 사용자에게 보여줄 상태 코드와 메시지로 바꾼다.
+function toErrorInfo(err: unknown): { status: number; message: string } {
+  const message = err instanceof Error ? err.message : 'Unknown error';
+
+  if (message.includes('503')) {
+    return { status: 503, message: 'API 서버가 일시적으로 과부하 상태입니다. 잠시 후 다시 시도해주세요.' };
+  }
+  if (message.includes('429')) {
+    return { status: 429, message: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' };
+  }
+  return { status: 500, message };
+}
+
+const NDJSON_HEADERS = {
+  ...CORS_HEADERS,
+  'Content-Type': 'application/x-ndjson; charset=utf-8',
+  'Cache-Control': 'no-cache',
+};
+
+// 프로바이더 스트림을 읽어 줄바꿈 단위 JSON 이벤트(delta/done/error)로 내려보낸다.
+function toEventStream(provider: Provider, body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const extract = provider === 'google' ? extractGoogleDelta : extractAnthropicDelta;
+
+  let cancelled = false;
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: object) => {
+        if (!cancelled) controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      };
+      let text = '';
+
+      try {
+        for await (const data of readSseData(body)) {
+          if (cancelled) break;
+          const delta = extract(data);
+          if (!delta) continue;
+          text += delta;
+          send({ type: 'delta', text: delta });
+        }
+        send({ type: 'done', code: ensureRenderCall(stripCodeFences(text)) });
+      } catch (err) {
+        send({ type: 'error', error: toErrorInfo(err).message });
+      } finally {
+        if (!cancelled) controller.close();
+      }
+    },
+    // 클라이언트가 연결을 끊으면 readSseData가 업스트림 연결을 닫도록 루프를 빠져나가게 한다.
+    cancel() {
+      cancelled = true;
+    },
+  });
+}
+
 const server = Bun.serve({
   port: 3002,
   async fetch(req) {
@@ -154,6 +261,42 @@ const server = Bun.serve({
         },
         { headers: CORS_HEADERS }
       );
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/generate/stream') {
+      try {
+        const { prompt, apiKey, provider = 'anthropic' } = (await req.json()) as {
+          prompt: string;
+          apiKey?: string;
+          provider?: Provider;
+        };
+
+        const resolvedKey = resolveApiKey(provider, apiKey);
+
+        if (!resolvedKey) {
+          return Response.json(
+            { error: `API key is required. Set ${provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'GOOGLE_API_KEY'} in .env or enter it manually.` },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+
+        if (!prompt) {
+          return Response.json(
+            { error: 'Prompt is required' },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+
+        const body =
+          provider === 'google'
+            ? await openGoogleStream(prompt, resolvedKey)
+            : await openAnthropicStream(prompt, resolvedKey);
+
+        return new Response(toEventStream(provider, body), { headers: NDJSON_HEADERS });
+      } catch (err) {
+        const { status, message } = toErrorInfo(err);
+        return Response.json({ error: message }, { status, headers: CORS_HEADERS });
+      }
     }
 
     if (req.method === 'POST' && url.pathname === '/api/generate') {
